@@ -8,6 +8,7 @@ IrisLite.dylib: cloaks.c IrisLite.m got_table.h
 	$(CC) $(ARCH) -dynamiclib \
 		-framework Foundation -framework UIKit -framework CoreLocation \
 		-o $@ cloaks.c IrisLite.m
+	strip -x $@
 	codesign --force -s - $@
 
 clean:

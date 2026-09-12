@@ -23,6 +23,7 @@
 #include <mach-o/dyld.h>
 #include <mach-o/dyld_images.h>
 #include <mach/mach.h>
+#include <mach/task_info.h>
 #include <mach/vm_map.h>
 #include "got_table.h"
 
@@ -40,12 +41,14 @@ enum {
     H_OPENDIR,
     H_DLADDR,
     H_IMGNAME,
+    H_TASKINFO,
     H_COUNT
 };
 
 static const unsigned long long kGot[H_COUNT] = {
     GOT_GETENV, GOT_SYSCTL, GOT_ACCESS, GOT_STAT, GOT_LSTAT,
-    GOT_OPEN, GOT_FOPEN, GOT_OPENDIR, GOT_DLADDR, GOT_DYLD_GET_IMAGE_NAME
+    GOT_OPEN, GOT_FOPEN, GOT_OPENDIR, GOT_DLADDR, GOT_DYLD_GET_IMAGE_NAME,
+    GOT_TASK_INFO
 };
 
 static void *g_saved[H_COUNT] = {0};
@@ -204,6 +207,46 @@ static const char *my_imgname(uint32_t idx) {
     return r;
 }
 
+// task_info: filter our traces out of TASK_DYLD_INFO image lists.
+// Only touches queries about our OWN task, from the guest image.
+static kern_return_t my_task_info(task_name_t target, task_flavor_t flavor,
+                                  task_info_t out, mach_msg_type_number_t *cnt) {
+    kern_return_t (*f)(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *) =
+        (kern_return_t (*)(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *))orig_of(H_TASKINFO);
+    if (!f) f = (kern_return_t (*)(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *))next_orig("task_info");
+    if (!f) return KERN_FAILURE;
+    kern_return_t r = f(target, flavor, out, cnt);
+    if (r != KERN_SUCCESS || flavor != TASK_DYLD_INFO) return r;
+    if (!out || !cnt || *cnt < TASK_DYLD_INFO_COUNT) return r;
+    if (target != mach_task_self()) return r;
+    if (!g_main_path[0] || !caller_is_guest()) return r;
+    struct task_dyld_info *di = (struct task_dyld_info *)out;
+    if (di->all_image_info_format != 1) return r; // 64-bit entries only
+    uint64_t base = (uint64_t)di->all_image_info_addr;
+    if (!base) return r;
+    uint32_t n = *(volatile uint32_t *)(base + 4);
+    uint64_t arr = *(volatile uint64_t *)(base + 8);
+    if (n == 0 || n > 4096 || !arr) return r;
+    size_t ml = strlen(g_main_path);
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t e = arr + (uint64_t)i * 24u;
+        uint64_t pa = *(volatile uint64_t *)(e + 8);
+        if (!pa) continue;
+        char *p = (char *)pa;
+        size_t L = strnlen(p, 1024);
+        if (L == 0 || L >= 1024) continue;
+        if (!banned_image(p)) continue;
+        if (strcmp(p, g_main_path) == 0) continue;
+        if (ml <= L) {
+            memcpy(p, g_main_path, ml + 1);
+        } else if (L > 0) {
+            memcpy(p, g_main_path, L);
+            p[L - 1] = '\0';
+        }
+    }
+    return r;
+}
+
 // ---------- __interpose (backup path; honored by dyld where applicable) ----------
 struct interpose { const void *newf; const void *orig; };
 #define INTERPOSE(hook, orig) \
@@ -220,6 +263,7 @@ INTERPOSE(fopen, fopen);
 INTERPOSE(opendir, opendir);
 INTERPOSE(dladdr, dladdr);
 INTERPOSE(imgname, _dyld_get_image_name);
+INTERPOSE(task_info, task_info);
 
 // ---------- constructor ----------
 static void *g_hooks[H_COUNT] = {0};
@@ -236,6 +280,7 @@ static void iris_init(void) {
     g_hooks[H_OPENDIR] = (void *)my_opendir;
     g_hooks[H_DLADDR] = (void *)my_dladdr;
     g_hooks[H_IMGNAME] = (void *)my_imgname;
+    g_hooks[H_TASKINFO] = (void *)my_task_info;
 
     long slide = _dyld_get_image_vmaddr_slide(0);
     for (int i = 0; i < H_COUNT; i++) {

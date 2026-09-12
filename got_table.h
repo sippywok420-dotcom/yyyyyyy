@@ -15,5 +15,6 @@
 #define GOT_SYSCTLBYNAME        0x10F72B6D0ull
 #define GOT_STATFS              0x10F72B5B0ull
 #define GOT_OPENDIR             0x10F72B180ull
+#define GOT_TASK_INFO           0x10F72B710ull
 
 #endif
