@@ -23,6 +23,7 @@
 #include <sys/proc.h>
 #include <mach-o/dyld.h>
 #include <mach-o/dyld_images.h>
+#include <mach-o/loader.h>
 #include <mach/mach.h>
 #include <mach/task_info.h>
 #include <mach/vm_map.h>
@@ -61,11 +62,12 @@ static long g_slide = 0;
 static uint32_t g_guest_idx = 0;
 static int g_slide_ok = 0;
 
-// original for entry i: saved copy once rebound, else live (pristine) GOT value
+// original for entry i: saved copy once rebound, else live (pristine) GOT value.
+// pre-discovery there is no slide yet: return NULL (callers fall back safely).
 static void *orig_of(int idx) {
     if (g_done[idx]) return g_saved[idx];
-    long sl = g_slide_ok ? g_slide : _dyld_get_image_vmaddr_slide(0);
-    void **loc = (void **)(unsigned long long)(kGot[idx] + (unsigned long long)sl);
+    if (!g_slide_ok) return 0;
+    void **loc = (void **)(unsigned long long)(kGot[idx] + (unsigned long long)g_slide);
     if (msync((void *)loc, 1, MS_ASYNC) != 0) return 0;
     return *loc;
 }
@@ -283,21 +285,62 @@ static void *probe_slot(unsigned long long unslid, long sl) {
     return *loc;
 }
 
-// does ptr resolve (via pristine-backed dladdr) into the given library?
-static int ptr_in_lib(void *p, const char *lib) {
-    if (!p) return 0;
-    Dl_info info;
-    memset(&info, 0, sizeof(info));
-    int (*rdl)(const void *, Dl_info *) =
-        (int (*)(const void *, Dl_info *))orig_of(H_DLADDR);
-    if (!rdl) rdl = (int (*)(const void *, Dl_info *))next_orig("dladdr");
-    if (!rdl) return 0;
-    if (rdl(p, &info) == 0 || !info.dli_fname) return 0;
-    return has_ins(info.dli_fname, lib) ? 1 : 0;
+// does ptr land inside the __TEXT of a loaded image whose LC_ID contains
+// wantLib (NULL = any image)? Pure header reads + guarded GOT reads.
+// Uses NO hooked functions, makes NO slide assumption: safe during discovery.
+static int ptr_in_image_text(void *p, const char *wantLib) {
+    uint32_t n = _dyld_image_count();
+    if (n > 4096) n = 4096;
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header_64 *h =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!h) continue;
+        if (msync((void *)h, 64, MS_ASYNC) != 0) continue;
+        if (h->magic != MH_MAGIC_64) continue;
+        uint32_t ncmds = h->ncmds;
+        if (ncmds > 512) continue;
+        long sl = _dyld_get_image_vmaddr_slide(i);
+        unsigned long long textAddr = 0, textSize = 0;
+        char idName[256];
+        idName[0] = 0;
+        uint8_t *lc = (uint8_t *)h + sizeof(struct mach_header_64);
+        for (uint32_t c = 0; c < ncmds; c++) {
+            uint32_t cmd = *(uint32_t *)lc;
+            uint32_t sz = *(uint32_t *)(lc + 4);
+            if (sz < 8 || sz > 65536) break;
+            if (cmd == 0x19) { // LC_SEGMENT_64
+                char seg[17];
+                memcpy(seg, lc + 8, 16);
+                seg[16] = 0;
+                if (strcmp(seg, "__TEXT") == 0) {
+                    memcpy(&textAddr, lc + 24, 8);
+                    memcpy(&textSize, lc + 32, 8);
+                }
+            } else if (cmd == 0xD) { // LC_ID_DYLIB
+                uint32_t no = *(uint32_t *)(lc + 8);
+                if (no < sz) {
+                    size_t k;
+                    for (k = 0; k < sizeof(idName) - 1 && k < (size_t)(sz - no); k++) {
+                        idName[k] = (char)lc[no + k];
+                        if (!idName[k]) break;
+                    }
+                    idName[k] = 0;
+                }
+            }
+            lc += sz;
+        }
+        if (!textAddr || !textSize) continue;
+        unsigned long long rt = textAddr + (unsigned long long)sl;
+        if ((unsigned long long)p >= rt && (unsigned long long)p < rt + textSize) {
+            if (!wantLib) return 1;
+            return has_ins(idName, wantLib) ? 1 : 0;
+        }
+    }
+    return 0;
 }
 
 // find which loaded image is the Snapchat guest: the one whose GOT slots
-// resolve into the expected system libraries (3/3 must match)
+// resolve into the exact expected system libraries (3/3 must match)
 static void discover_guest(void) {
     uint32_t n = _dyld_image_count();
     if (n > 4096) n = 4096;
@@ -307,9 +350,9 @@ static void discover_guest(void) {
         void *b = probe_slot(GOT_SYSCTL, sl);
         void *c = probe_slot(GOT_OPEN, sl);
         if (!a || !b || !c) continue;
-        if (ptr_in_lib(a, "libsystem_c") &&
-            ptr_in_lib(b, "libsystem_kernel") &&
-            ptr_in_lib(c, "libsystem_kernel")) {
+        if (ptr_in_image_text(a, "libsystem_c") &&
+            ptr_in_image_text(b, "libsystem_kernel") &&
+            ptr_in_image_text(c, "libsystem_kernel")) {
             g_slide = sl;
             g_guest_idx = i;
             g_slide_ok = 1;
