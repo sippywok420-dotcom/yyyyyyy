@@ -1,8 +1,11 @@
-// IrisLite - low-level cloaks (C)
-// Primary mechanism: __interpose (dyld applies at launch).
-// Backup mechanism: GOT rebinding in the main image (constructor, verified addrs).
+// IrisLite - low-level cloaks, v2 (C)
+// Primary mechanism: GOT rebinding in the main image (verified addrs, table-driven).
+// Backup mechanism: __interpose (dyld applies at launch where honored).
+// Init-safety: every hook resolves its original through the table. Entries not
+// yet rebound read the still-pristine GOT (safe: dyld bound it at launch);
+// rebound entries use the saved original. No dlsym before init, no recursion.
 // Caller-scoped: cloaks only apply when the CALLER is the Snapchat guest image,
-// so the LiveContainer host process keeps working normally.
+// so the host process and system frameworks keep working normally.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,17 +28,40 @@
 
 extern void iris_objc_init(void);
 
-// ---------- saved originals ----------
-static char *(*g_orig_getenv)(const char *) = 0;
-static int (*g_orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = 0;
-static int (*g_orig_access)(const char *, int) = 0;
-static int (*g_orig_stat)(const char *, struct stat *) = 0;
-static int (*g_orig_lstat)(const char *, struct stat *) = 0;
-static int (*g_orig_open)(const char *, int, ...) = 0;
-static FILE *(*g_orig_fopen)(const char *, const char *) = 0;
-static DIR *(*g_orig_opendir)(const char *) = 0;
-static int (*g_orig_dladdr)(const void *, Dl_info *) = 0;
-static const char *(*g_orig_imgname)(uint32_t) = 0;
+// ---------- hook table ----------
+enum {
+    H_GETENV = 0,
+    H_SYSCTL,
+    H_ACCESS,
+    H_STAT,
+    H_LSTAT,
+    H_OPEN,
+    H_FOPEN,
+    H_OPENDIR,
+    H_DLADDR,
+    H_IMGNAME,
+    H_COUNT
+};
+
+static const unsigned long long kGot[H_COUNT] = {
+    GOT_GETENV, GOT_SYSCTL, GOT_ACCESS, GOT_STAT, GOT_LSTAT,
+    GOT_OPEN, GOT_FOPEN, GOT_OPENDIR, GOT_DLADDR, GOT_DYLD_GET_IMAGE_NAME
+};
+
+static void *g_saved[H_COUNT] = {0};
+static int g_done[H_COUNT] = {0};
+
+// original for entry i: saved copy once rebound, else live (pristine) GOT value
+static void *orig_of(int idx) {
+    if (g_done[idx]) return g_saved[idx];
+    long slide = _dyld_get_image_vmaddr_slide(0);
+    void **loc = (void **)(unsigned long long)(kGot[idx] + (unsigned long long)slide);
+    return *loc;
+}
+
+static void *next_orig(const char *name) {
+    return dlsym(RTLD_NEXT, name);
+}
 
 static char g_main_path[1024] = {0};
 
@@ -50,7 +76,7 @@ static int has_ins(const char *hay, const char *needle) {
     return 0;
 }
 
-// banned in FILE paths (never cloak our own config: IrisLite.plist must stay visible)
+// banned in FILE paths (our own config IrisLite.plist must stay visible)
 static int banned_path(const char *p) {
     return has_ins(p, "livecontainer");
 }
@@ -60,22 +86,22 @@ static int banned_image(const char *p) {
     return has_ins(p, "livecontainer") || has_ins(p, "irislite");
 }
 
+static void *orig_dladdr_fn(void) {
+    void *f = orig_of(H_DLADDR);
+    if (!f) f = next_orig("dladdr");
+    return f;
+}
+
 // is the direct caller inside the Snapchat guest image?
 static int caller_is_guest(void) {
     void *ret = __builtin_return_address(0);
     Dl_info info;
     memset(&info, 0, sizeof(info));
-    int (*rdl)(const void *, Dl_info *) = g_orig_dladdr;
-    if (!rdl) {
-        rdl = (int (*)(const void *, Dl_info *))dlsym(RTLD_NEXT, "dladdr");
-        if (!rdl) return 0;
-    }
+    int (*rdl)(const void *, Dl_info *) =
+        (int (*)(const void *, Dl_info *))orig_dladdr_fn();
+    if (!rdl) return 0;
     if (rdl(ret, &info) == 0 || !info.dli_fname) return 0;
     return has_ins(info.dli_fname, "Snapchat.app") ? 1 : 0;
-}
-
-static void *next_orig(const char *name) {
-    return dlsym(RTLD_NEXT, name);
 }
 
 // ---------- hooks ----------
@@ -83,13 +109,14 @@ static char *my_getenv(const char *name) {
     if (name && strncmp(name, "DYLD_", 5) == 0) {
         if (caller_is_guest()) return 0;
     }
-    char *(*f)(const char *) = g_orig_getenv;
+    char *(*f)(const char *) = (char *(*)(const char *))orig_of(H_GETENV);
     if (!f) f = (char *(*)(const char *))next_orig("getenv");
     return f ? f(name) : 0;
 }
 
 static int my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    int (*f)(int *, u_int, void *, size_t *, void *, size_t) = g_orig_sysctl;
+    int (*f)(int *, u_int, void *, size_t *, void *, size_t) =
+        (int (*)(int *, u_int, void *, size_t *, void *, size_t))orig_of(H_SYSCTL);
     if (!f) f = (int (*)(int *, u_int, void *, size_t *, void *, size_t))next_orig("sysctl");
     if (!f) { errno = ENOMEM; return -1; }
     int r = f(name, namelen, oldp, oldlenp, newp, newlen);
@@ -104,7 +131,7 @@ static int my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void
 
 static int my_access(const char *path, int mode) {
     if (path && banned_path(path) && caller_is_guest()) { errno = ENOENT; return -1; }
-    int (*f)(const char *, int) = g_orig_access;
+    int (*f)(const char *, int) = (int (*)(const char *, int))orig_of(H_ACCESS);
     if (!f) f = (int (*)(const char *, int))next_orig("access");
     if (!f) { errno = ENOENT; return -1; }
     return f(path, mode);
@@ -112,7 +139,7 @@ static int my_access(const char *path, int mode) {
 
 static int my_stat(const char *path, struct stat *buf) {
     if (path && banned_path(path) && caller_is_guest()) { errno = ENOENT; return -1; }
-    int (*f)(const char *, struct stat *) = g_orig_stat;
+    int (*f)(const char *, struct stat *) = (int (*)(const char *, struct stat *))orig_of(H_STAT);
     if (!f) f = (int (*)(const char *, struct stat *))next_orig("stat");
     if (!f) { errno = ENOENT; return -1; }
     return f(path, buf);
@@ -120,7 +147,7 @@ static int my_stat(const char *path, struct stat *buf) {
 
 static int my_lstat(const char *path, struct stat *buf) {
     if (path && banned_path(path) && caller_is_guest()) { errno = ENOENT; return -1; }
-    int (*f)(const char *, struct stat *) = g_orig_lstat;
+    int (*f)(const char *, struct stat *) = (int (*)(const char *, struct stat *))orig_of(H_LSTAT);
     if (!f) f = (int (*)(const char *, struct stat *))next_orig("lstat");
     if (!f) { errno = ENOENT; return -1; }
     return f(path, buf);
@@ -135,7 +162,7 @@ static int my_open(const char *path, int flags, ...) {
         va_end(ap);
     }
     if (path && banned_path(path) && caller_is_guest()) { errno = ENOENT; return -1; }
-    int (*f)(const char *, int, ...) = g_orig_open;
+    int (*f)(const char *, int, ...) = (int (*)(const char *, int, ...))orig_of(H_OPEN);
     if (!f) f = (int (*)(const char *, int, ...))next_orig("open");
     if (!f) { errno = ENOENT; return -1; }
     if (flags & O_CREAT) return f(path, flags, mode);
@@ -144,31 +171,31 @@ static int my_open(const char *path, int flags, ...) {
 
 static FILE *my_fopen(const char *path, const char *mode) {
     if (path && banned_path(path) && caller_is_guest()) { errno = ENOENT; return 0; }
-    FILE *(*f)(const char *, const char *) = g_orig_fopen;
+    FILE *(*f)(const char *, const char *) = (FILE *(*)(const char *, const char *))orig_of(H_FOPEN);
     if (!f) f = (FILE *(*)(const char *, const char *))next_orig("fopen");
     return f ? f(path, mode) : 0;
 }
 
 static DIR *my_opendir(const char *path) {
     if (path && banned_path(path) && caller_is_guest()) { errno = ENOENT; return 0; }
-    DIR *(*f)(const char *) = g_orig_opendir;
+    DIR *(*f)(const char *) = (DIR *(*)(const char *))orig_of(H_OPENDIR);
     if (!f) f = (DIR *(*)(const char *))next_orig("opendir");
     return f ? f(path) : 0;
 }
 
 static int my_dladdr(const void *addr, Dl_info *info) {
-    int (*f)(const void *, Dl_info *) = g_orig_dladdr;
+    int (*f)(const void *, Dl_info *) = (int (*)(const void *, Dl_info *))orig_of(H_DLADDR);
     if (!f) f = (int (*)(const void *, Dl_info *))next_orig("dladdr");
     if (!f) return 0;
     int r = f(addr, info);
     if (r != 0 && info->dli_fname && banned_image(info->dli_fname) && caller_is_guest()) {
-        info->dli_fname = g_main_path[0] ? g_main_path : info->dli_fname;
+        if (g_main_path[0]) info->dli_fname = g_main_path;
     }
     return r;
 }
 
 static const char *my_imgname(uint32_t idx) {
-    const char *(*f)(uint32_t) = g_orig_imgname;
+    const char *(*f)(uint32_t) = (const char *(*)(uint32_t))orig_of(H_IMGNAME);
     if (!f) f = (const char *(*)(uint32_t))next_orig("_dyld_get_image_name");
     const char *r = f ? f(idx) : 0;
     if (r && banned_image(r) && caller_is_guest()) {
@@ -177,7 +204,7 @@ static const char *my_imgname(uint32_t idx) {
     return r;
 }
 
-// ---------- __interpose ----------
+// ---------- __interpose (backup path; honored by dyld where applicable) ----------
 struct interpose { const void *newf; const void *orig; };
 #define INTERPOSE(hook, orig) \
     static const struct interpose _ip_##hook __attribute__((used, section("__DATA,__interpose"))) = \
@@ -194,33 +221,52 @@ INTERPOSE(opendir, opendir);
 INTERPOSE(dladdr, dladdr);
 INTERPOSE(imgname, _dyld_get_image_name);
 
-// ---------- GOT backup patch ----------
-static void patch_one(unsigned long long unslid, void *hook, void **save) {
-    long slide = _dyld_get_image_vmaddr_slide(0);
-    void **loc = (void **)(unsigned long long)(unslid + (unsigned long long)slide);
-    *save = *loc;
-    vm_address_t page = (vm_address_t)loc & ~((vm_address_t)0x3FFF);
-    vm_protect(mach_task_self(), page, (vm_size_t)0x4000, FALSE,
-               VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    *loc = hook;
-    vm_protect(mach_task_self(), page, (vm_size_t)0x4000, FALSE, VM_PROT_READ);
-}
+// ---------- constructor ----------
+static void *g_hooks[H_COUNT] = {0};
 
 __attribute__((constructor))
 static void iris_init(void) {
-    patch_one(GOT_GETENV, (void *)my_getenv, (void **)&g_orig_getenv);
-    patch_one(GOT_SYSCTL, (void *)my_sysctl, (void **)&g_orig_sysctl);
-    patch_one(GOT_ACCESS, (void *)my_access, (void **)&g_orig_access);
-    patch_one(GOT_STAT, (void *)my_stat, (void **)&g_orig_stat);
-    patch_one(GOT_LSTAT, (void *)my_lstat, (void **)&g_orig_lstat);
-    patch_one(GOT_OPEN, (void *)my_open, (void **)&g_orig_open);
-    patch_one(GOT_FOPEN, (void *)my_fopen, (void **)&g_orig_fopen);
-    patch_one(GOT_OPENDIR, (void *)my_opendir, (void **)&g_orig_opendir);
-    patch_one(GOT_DLADDR, (void *)my_dladdr, (void **)&g_orig_dladdr);
-    patch_one(GOT_DYLD_GET_IMAGE_NAME, (void *)my_imgname, (void **)&g_orig_imgname);
+    g_hooks[H_GETENV] = (void *)my_getenv;
+    g_hooks[H_SYSCTL] = (void *)my_sysctl;
+    g_hooks[H_ACCESS] = (void *)my_access;
+    g_hooks[H_STAT] = (void *)my_stat;
+    g_hooks[H_LSTAT] = (void *)my_lstat;
+    g_hooks[H_OPEN] = (void *)my_open;
+    g_hooks[H_FOPEN] = (void *)my_fopen;
+    g_hooks[H_OPENDIR] = (void *)my_opendir;
+    g_hooks[H_DLADDR] = (void *)my_dladdr;
+    g_hooks[H_IMGNAME] = (void *)my_imgname;
 
-    if (g_orig_imgname) {
-        const char *mp = g_orig_imgname(0);
+    long slide = _dyld_get_image_vmaddr_slide(0);
+    for (int i = 0; i < H_COUNT; i++) {
+        void **loc = (void **)(unsigned long long)(kGot[i] + (unsigned long long)slide);
+        void *cur = *loc;
+        // validate: must resolve inside a system library, else skip this entry
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        int ok = 0;
+        {
+            int (*rdl)(const void *, Dl_info *) =
+                (int (*)(const void *, Dl_info *))orig_of(H_DLADDR);
+            if (!rdl) rdl = (int (*)(const void *, Dl_info *))next_orig("dladdr");
+            if (rdl && cur && rdl(cur, &info) != 0 && info.dli_fname) {
+                if (has_ins(info.dli_fname, "/usr/lib/") ||
+                    has_ins(info.dli_fname, "/System/Library/")) ok = 1;
+            }
+        }
+        if (!ok) continue;
+        g_saved[i] = cur;
+        g_done[i] = 1;
+        vm_address_t page = (vm_address_t)loc & ~((vm_address_t)0x3FFF);
+        vm_protect(mach_task_self(), page, (vm_size_t)0x4000, FALSE,
+                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        *loc = g_hooks[i];
+        vm_protect(mach_task_self(), page, (vm_size_t)0x4000, FALSE, VM_PROT_READ);
+    }
+
+    if (g_done[H_IMGNAME] && g_saved[H_IMGNAME]) {
+        const char *(*f)(uint32_t) = (const char *(*)(uint32_t))g_saved[H_IMGNAME];
+        const char *mp = f(0);
         if (mp) {
             strncpy(g_main_path, mp, sizeof(g_main_path) - 1);
             g_main_path[sizeof(g_main_path) - 1] = '\0';
