@@ -17,6 +17,7 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/proc.h>
@@ -54,11 +55,18 @@ static const unsigned long long kGot[H_COUNT] = {
 static void *g_saved[H_COUNT] = {0};
 static int g_done[H_COUNT] = {0};
 
+// slide + index of the guest image (ours differs per environment:
+// sideload = image 0, LiveContainer = dlopen'd guest). Discovered at init.
+static long g_slide = 0;
+static uint32_t g_guest_idx = 0;
+static int g_slide_ok = 0;
+
 // original for entry i: saved copy once rebound, else live (pristine) GOT value
 static void *orig_of(int idx) {
     if (g_done[idx]) return g_saved[idx];
-    long slide = _dyld_get_image_vmaddr_slide(0);
-    void **loc = (void **)(unsigned long long)(kGot[idx] + (unsigned long long)slide);
+    long sl = g_slide_ok ? g_slide : _dyld_get_image_vmaddr_slide(0);
+    void **loc = (void **)(unsigned long long)(kGot[idx] + (unsigned long long)sl);
+    if (msync((void *)loc, 1, MS_ASYNC) != 0) return 0;
     return *loc;
 }
 
@@ -268,8 +276,55 @@ INTERPOSE(task_info, task_info);
 // ---------- constructor ----------
 static void *g_hooks[H_COUNT] = {0};
 
+// read a GOT slot under a candidate slide; NULL when unreadable
+static void *probe_slot(unsigned long long unslid, long sl) {
+    void **loc = (void **)(unsigned long long)(unslid + (unsigned long long)sl);
+    if (msync((void *)loc, 1, MS_ASYNC) != 0) return 0;
+    return *loc;
+}
+
+// does ptr resolve (via pristine-backed dladdr) into the given library?
+static int ptr_in_lib(void *p, const char *lib) {
+    if (!p) return 0;
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
+    int (*rdl)(const void *, Dl_info *) =
+        (int (*)(const void *, Dl_info *))orig_of(H_DLADDR);
+    if (!rdl) rdl = (int (*)(const void *, Dl_info *))next_orig("dladdr");
+    if (!rdl) return 0;
+    if (rdl(p, &info) == 0 || !info.dli_fname) return 0;
+    return has_ins(info.dli_fname, lib) ? 1 : 0;
+}
+
+// find which loaded image is the Snapchat guest: the one whose GOT slots
+// resolve into the expected system libraries (3/3 must match)
+static void discover_guest(void) {
+    uint32_t n = _dyld_image_count();
+    if (n > 4096) n = 4096;
+    for (uint32_t i = 0; i < n; i++) {
+        long sl = _dyld_get_image_vmaddr_slide(i);
+        void *a = probe_slot(GOT_GETENV, sl);
+        void *b = probe_slot(GOT_SYSCTL, sl);
+        void *c = probe_slot(GOT_OPEN, sl);
+        if (!a || !b || !c) continue;
+        if (ptr_in_lib(a, "libsystem_c") &&
+            ptr_in_lib(b, "libsystem_kernel") &&
+            ptr_in_lib(c, "libsystem_kernel")) {
+            g_slide = sl;
+            g_guest_idx = i;
+            g_slide_ok = 1;
+            return;
+        }
+    }
+    g_slide = _dyld_get_image_vmaddr_slide(0);
+    g_guest_idx = 0;
+    g_slide_ok = 1;
+}
+
 __attribute__((constructor))
 static void iris_init(void) {
+    discover_guest();
+
     g_hooks[H_GETENV] = (void *)my_getenv;
     g_hooks[H_SYSCTL] = (void *)my_sysctl;
     g_hooks[H_ACCESS] = (void *)my_access;
@@ -282,7 +337,7 @@ static void iris_init(void) {
     g_hooks[H_IMGNAME] = (void *)my_imgname;
     g_hooks[H_TASKINFO] = (void *)my_task_info;
 
-    long slide = _dyld_get_image_vmaddr_slide(0);
+    long slide = g_slide;
     for (int i = 0; i < H_COUNT; i++) {
         void **loc = (void **)(unsigned long long)(kGot[i] + (unsigned long long)slide);
         void *cur = *loc;
@@ -311,7 +366,7 @@ static void iris_init(void) {
 
     if (g_done[H_IMGNAME] && g_saved[H_IMGNAME]) {
         const char *(*f)(uint32_t) = (const char *(*)(uint32_t))g_saved[H_IMGNAME];
-        const char *mp = f(0);
+        const char *mp = f(g_guest_idx);
         if (mp) {
             strncpy(g_main_path, mp, sizeof(g_main_path) - 1);
             g_main_path[sizeof(g_main_path) - 1] = '\0';
